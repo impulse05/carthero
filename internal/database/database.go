@@ -1,16 +1,15 @@
 package database
 
 import (
-	"context"
-	"database/sql"
+	"carthero/internal/model"
 	"fmt"
 	"log"
 	"os"
-	"strconv"
-	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/joho/godotenv/autoload"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // Service represents a service that interacts with a database.
@@ -22,10 +21,26 @@ type Service interface {
 	// Close terminates the database connection.
 	// It returns an error if the connection cannot be closed.
 	Close() error
+
+	// GetRiders returns a list of riders from the database.
+	GetRiders() ([]model.Rider, error)
+
+	// fetch free riders
+
+	GetFreeRiders() ([]model.Rider, error)
+
+	// update rider status
+	UpdateRiderStatus(id int, status bool) error
+
+	// create rider
+	CreateRider(rider model.Rider) (model.Rider, error)
+
+	// delete rider
+	DeleteRider(id int) error
 }
 
 type service struct {
-	db *sql.DB
+	db *gorm.DB
 }
 
 var (
@@ -40,72 +55,46 @@ var (
 func New() Service {
 	// Reuse Connection
 	if dbInstance != nil {
-		return dbInstance
+		return &service{
+			db: dbInstance.db,
+		}
 	}
 
-	// Opening a driver typically will not attempt to connect to the database.
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", username, password, host, port, dbname))
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", username, password, host, port, dbname)
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Info),
+	})
+
 	if err != nil {
-		// This will not be a connection error, but a DSN parse error or
-		// another initialization error.
-		log.Fatal(err)
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	db.SetConnMaxLifetime(0)
-	db.SetMaxIdleConns(50)
-	db.SetMaxOpenConns(50)
 
-	dbInstance = &service{
-		db: db,
-	}
+	dbInstance = &service{db: db}
+	log.Printf("Connected to database: %s", dbname)
+	db.AutoMigrate(new(model.Rider))
+
 	return dbInstance
+
 }
 
 // Health checks the health of the database connection by pinging the database.
 // It returns a map with keys indicating various health statistics.
 func (s *service) Health() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
 
 	stats := make(map[string]string)
 
-	// Ping the database
-	err := s.db.PingContext(ctx)
+	db, err := s.db.DB()
 	if err != nil {
-		stats["status"] = "down"
-		stats["error"] = fmt.Sprintf("db down: %v", err)
-		log.Fatalf(fmt.Sprintf("db down: %v", err)) // Log the error and terminate the program
-		return stats
+		stats["status"] = "error"
+		stats["error"] = err.Error()
 	}
-
-	// Database is up, add more statistics
-	stats["status"] = "up"
-	stats["message"] = "It's healthy"
-
-	// Get database stats (like open connections, in use, idle, etc.)
-	dbStats := s.db.Stats()
-	stats["open_connections"] = strconv.Itoa(dbStats.OpenConnections)
-	stats["in_use"] = strconv.Itoa(dbStats.InUse)
-	stats["idle"] = strconv.Itoa(dbStats.Idle)
-	stats["wait_count"] = strconv.FormatInt(dbStats.WaitCount, 10)
-	stats["wait_duration"] = dbStats.WaitDuration.String()
-	stats["max_idle_closed"] = strconv.FormatInt(dbStats.MaxIdleClosed, 10)
-	stats["max_lifetime_closed"] = strconv.FormatInt(dbStats.MaxLifetimeClosed, 10)
-
-	// Evaluate stats to provide a health message
-	if dbStats.OpenConnections > 40 { // Assuming 50 is the max for this example
-		stats["message"] = "The database is experiencing heavy load."
+	err = db.Ping()
+	if err != nil {
+		stats["status"] = "error"
+		stats["error"] = err.Error()
 	}
-	if dbStats.WaitCount > 1000 {
-		stats["message"] = "The database has a high number of wait events, indicating potential bottlenecks."
-	}
-
-	if dbStats.MaxIdleClosed > int64(dbStats.OpenConnections)/2 {
-		stats["message"] = "Many idle connections are being closed, consider revising the connection pool settings."
-	}
-
-	if dbStats.MaxLifetimeClosed > int64(dbStats.OpenConnections)/2 {
-		stats["message"] = "Many connections are being closed due to max lifetime, consider increasing max lifetime or revising the connection usage pattern."
-	}
+	stats["status"] = "ok"
+	stats["database"] = dbname
 
 	return stats
 }
@@ -116,5 +105,42 @@ func (s *service) Health() map[string]string {
 // If an error occurs while closing the connection, it returns the error.
 func (s *service) Close() error {
 	log.Printf("Disconnected from database: %s", dbname)
-	return s.db.Close()
+	db, err := s.db.DB()
+	if err != nil {
+		return err
+	}
+	return db.Close()
+}
+
+// GetRiders returns a list of riders from the database.
+func (s *service) GetRiders() ([]model.Rider, error) {
+	var riders []model.Rider
+	result := s.db.Find(&riders)
+	return riders, result.Error
+}
+
+// GetFreeRiders returns a list of free riders from the database.
+func (s *service) GetFreeRiders() ([]model.Rider, error) {
+	var riders []model.Rider
+	result := s.db.Where("assigned = ?", false).Find(&riders)
+	return riders, result.Error
+}
+
+// UpdateRiderStatus updates the status of a rider in the database.
+func (s *service) UpdateRiderStatus(id int, status bool) error {
+	result := s.db.Model(&model.Rider{}).Where("id = ?", id).Update("assigned", status)
+	return result.Error
+}
+
+// CreateRider creates a new rider in the database.
+func (s *service) CreateRider(rider model.Rider) (model.Rider, error) {
+	result := s.db.Create(&rider)
+
+	return rider, result.Error
+}
+
+// DeleteRider deletes a rider from the database.
+func (s *service) DeleteRider(id int) error {
+	result := s.db.Where("id = ?", id).Delete(&model.Rider{})
+	return result.Error
 }
